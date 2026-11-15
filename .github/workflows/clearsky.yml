@@ -1,0 +1,115 @@
+name: Update clear sky feed
+
+# Runs every 3 hours. You can also run it by hand: Actions tab > Update clear sky feed > Run workflow.
+# The feed is published with GitHub Pages at
+#   https://darksky-commits.github.io/dsd-clearsky/clearsky.json
+on:
+  schedule:
+    - cron: "23 */3 * * *"   # UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write    # for the monthly heartbeat commit
+  pages: write       # to publish the feed
+  id-token: write    # required by the Pages deploy step
+
+concurrency:
+  group: clearsky
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PAGES_URL: https://darksky-commits.github.io/dsd-clearsky
+      NWS_CONTACT: https://darkskydispatch.com
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      # Pull the last published feed so hours that already passed carry over, and so
+      # the point lookup cache survives between runs. The very first run has nothing
+      # to pull, which is fine.
+      - name: Restore previous feed
+        run: |
+          mkdir -p public
+          if curl -fsSL --retry 2 "$PAGES_URL/clearsky.json" -o /tmp/prev-feed.json; then
+            cp /tmp/prev-feed.json public/clearsky.json
+            echo "Restored previous feed."
+          else
+            echo "No previous feed yet."
+          fi
+          if curl -fsSL --retry 2 "$PAGES_URL/gridpoint_cache.json" -o /tmp/prev-cache.json; then
+            cp /tmp/prev-cache.json gridpoint_cache.json
+            echo "Restored point cache."
+          else
+            echo "No point cache yet, the first run looks every point up."
+          fi
+
+      - name: Build feed from NOAA
+        run: python3 update_clearsky.py --out public/clearsky.json --cache gridpoint_cache.json
+
+      - name: Write status files
+        run: |
+          cp gridpoint_cache.json public/gridpoint_cache.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open("public/clearsky.json"))
+          st = {"generated": d["generated"], "points": len(d["idx"]), "hours": d["hours"]}
+          json.dump(st, open("public/status.json", "w"))
+          html = ("<!doctype html><meta charset=utf-8><title>Clear Skies feed status</title>"
+                  "<body style='font:16px system-ui;padding:2rem'>"
+                  "<h1>Clear Skies Tonight feed</h1>"
+                  "<p>Last built: <b>%s</b> (UTC)</p><p>Points: %d</p>"
+                  "<p><a href='clearsky.json'>clearsky.json</a></p></body>") % (st["generated"], st["points"])
+          open("public/index.html", "w").write(html)
+          PY
+          ls -la public
+
+      - uses: actions/configure-pages@v6
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
+
+  # GitHub pauses scheduled jobs in a public repo after 60 days with no commits.
+  # One tiny commit about once a month keeps the schedule running. It runs after the
+  # data is already live, so if it ever fails it cannot hurt the feed.
+  heartbeat:
+    needs: deploy
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Monthly heartbeat commit
+        run: |
+          last=$(git log -1 --format=%ct -- last-run.json 2>/dev/null || true)
+          last=${last:-0}
+          now=$(date +%s)
+          if [ $((now - last)) -gt $((25 * 86400)) ]; then
+            date -u +'{"alive":"%Y-%m-%dT%H:%M:%SZ"}' > last-run.json
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add last-run.json
+            git commit -m "Monthly heartbeat: clearsky job is running"
+            git push origin HEAD
+          else
+            echo "Heartbeat not due yet."
+          fi
